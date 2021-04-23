@@ -61,7 +61,7 @@ param (
         HelpMessage = "A required parameter. Name of the package."
     )]
     [string]$Name,
-    [ValidateSet("Install", "Query", IgnoreCase = $true)]
+    [ValidateSet("Install", "Query", "Uninstall", "Uninstall-Dependencies", IgnoreCase = $true)]
     [string]$Action = "Install",
     [switch]$AllVersions = $false,
     [switch]$AllowPrerelease = $false,
@@ -91,9 +91,9 @@ function Format-ToWidthAtWordBreaks() {
         [int]$Width
     )
 
-    $text = Get-NormalizedText $text
-
     $indent = [system.string]::New(" ", $FirstLine.Length)
+
+    $text = Get-NormalizedText $text
 
     $words = $text -split " "
 
@@ -102,8 +102,7 @@ function Format-ToWidthAtWordBreaks() {
 
     $words | foreach-object {
         $current = $_.Trim()
-        if (($lines.count -eq 0 -And ($line + $current).Length + 1 -ge $r) -Or
-            ($lines.count -gt 0 -And ($line + $current).Length + 1 -ge $screenWidth)) {
+        if ((($line + $current).Length + 1 -ge $Width)) {
             $lines = $lines + $line
             $line = $indent
         }
@@ -117,8 +116,7 @@ function Format-ToWidthAtWordBreaks() {
         $lines = $lines + $line
     }
 
-    $alltext = $lines -join "`r`n"
-    $alltext
+    $lines
 }
 
 function Format-ToWidth() {
@@ -144,6 +142,10 @@ function Format-ToWidth() {
 
 $screenWidth = $Host.UI.RawUI.WindowSize.Width
 
+if ($Action -ieq "Uninstall-Dependencies") {
+    $IncludeDependencies = $true
+}
+
 Write-Output "Action $($Action)"
 Write-Output "Finding $($Name)"
 if ($AllowPrerelease) {
@@ -165,6 +167,11 @@ $InstallFound = Get-InstalledModule -Name $Name -ErrorAction Ignore
 $installed = $false
 $installedIndex = -1
 
+$dependencies = @{ "first-item-test" = @() }
+
+Write-Output "packages.count = $($packages.Count)"
+Write-Output "dependencies.Count = $($dependencies.Count)"
+
 $i = 1
 foreach ($package in $packages) {
     if ($null -ne $InstallFound -And $InstallFound.Name -eq $package.Name -And $InstallFound.Version -eq $package.Version) {
@@ -181,42 +188,26 @@ foreach ($package in $packages) {
     else {
         $line = "  "
     }
-    $line += "($($i)):`t$($package.Name) | $($package.Version) | $($package.Source) | "
+    $line += "($($i)):"
+    while ($line.Length -lt 8) { $line += " " }
+    $line += "$($package.Name) | $($package.Version) | $($package.Source) | "
     $w = ($screenWidth - $line.Length)
-    Write-output "WWWWW=$($w) / $($screenWidth) / $($line.Length)"
     if ($FullDescription) {
-        $lines += Format-ToWidthAtWordBreaks $package.Summary, $line.Length, $screenWidth
-        $lines
-        $lines | Write-Output
+        $lines += Format-ToWidthAtWordBreaks -Text $package.Summary -FirstLine $line -Width $screenWidth
+        $lines | ForEach-Object { Write-Output $_ }
     } else {
-        $line += Format-ToWidth -Text $package.Summary -Width $w -WithElipses 
-        Write-Output "0000" + $line
+        $line += Format-ToWidth -Text $package.Summary -Width $w -WithElipses
+        $line | Write-Output
     }
     
     if ($IncludeDependencies) {
-        $e = ( $package.Dependencies | foreach-object { $a = $_; $b = $a -split { $_ -eq ":" -or $_ -eq "#" }; $c = $b[1] -split '/'; $d = "$($c[0]) $($c[1])"; $d } )
-        $e = $e | Sort-Object
+        $e = ( $package.Dependencies | foreach-object { $a = $_; $b = $a -split { $_ -eq ":" -or $_ -eq "#" }; $c = $b[1] -split '/'; $d = @{Name=$c[0]; Version=$c[1]}; $d } )
+        $e = $e | Sort-Object -Property Name
 
         $indent = "      "
-        $line = $indent
-        $e | foreach-object {
-            $current = $_.Trim()
-            if (($line + $current).Length + 2 -ge $screenWidth) {
-                Write-Output $line
-                $line = $indent
-            }
-            if (-Not $line.EndsWith(" ")) {
-                $line = $line + ", "
-            }
-            $line = $line + $current
-        }
-        $cleanLine = $line.Replace(" ", "")
-        if ($cleanLine.EndsWith(",")) {
-            $cleanLine = $cleanLine.Substring(0, $cleanLine.Length - 1)
-        }
-        if ($cleanLine.Length -gt 0) {
-            Write-Output $line
-        }
+        $dependencies += @{ $package.Name = $e }
+        $data = $e | foreach-object { "$($_.Name)[$($_.Version.Replace('[','').Replace(']',''))]" }
+        Format-ToWidthAtWordBreaks -Text $data -FirstLine "      " -Width $screenWidth | ForEach-Object { Write-Output $_ }
     }
     $i++
 }
@@ -233,7 +224,8 @@ if ($installedIndex -eq -1 -And $InstallFound) {
 
 $output = $null
 
-if ($Action -ieq "Install") {
+
+if ($Action -ieq "Install" -Or $Action -ieq "Uninstall" -Or $Action -ieq "Uninstall-Dependencies") {
     $i--
     if ($NoUserInput) {
         $Choose = 1
@@ -252,6 +244,9 @@ if ($Action -ieq "Install") {
         }
     }
     $Choose = $Choose - 1
+}
+
+if ($Action -ieq "Install") {
     # $version = [System.Version]::Parse("11.00.9600.17840")
     if ($Choose -ge 0 -And $Choose -le $i) {
         $toInstall = $packages[$Choose]
@@ -292,3 +287,22 @@ if ($Action -ieq "Install") {
 # $json = $output | ConvertTo-Json -Depth 5
 # Write-Output "JSON:`r`n$($json)"
 
+if ($Action -ieq "Uninstall") {
+    if ($Choose -ge 0 -And $Choose -le $i) {
+        $Installed = $packages[$Choose]
+    }
+    Write-Output "Uninstalling $($Installed.Name) version $($Installed.Version)"
+    $output = Uninstall-Package -Name $Installed.Name -RequiredVersion $Installed.Version -Force
+}
+
+if ($Action -ieq "Uninstall-Dependencies") {
+    if ($Choose -ge 0 -And $Choose -le $i) {
+        $Installed = $packages[$Choose]
+    }
+    $dependencySet = $dependencies[$Installed.Name]
+    $dependencySet | ForEach-Object {
+        $Current = $_
+        Write-Output "Uninstalling $($Current.Name) version $($Current.Version)"
+        $output = Uninstall-Package -Name $Current.Name -RequiredVersion $Current.Version -Force
+    }
+}
